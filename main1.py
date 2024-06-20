@@ -1,8 +1,10 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 from firebase_admin import credentials, auth, initialize_app, firestore
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+import numpy as np
+import tensorflow as tf
 import logging
 import httpx
 import os
@@ -17,6 +19,9 @@ initialize_app(cred)
 # Initialize Firestore client
 db = firestore.client()
 
+# Initialize the Keras model
+model = tf.keras.models.load_model('model.h5')
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 
@@ -24,30 +29,6 @@ logging.basicConfig(level=logging.DEBUG)
 class User(BaseModel):
     email: str
     password: str
-
-class AuthResponse(BaseModel):
-    message: str
-    token: str = None
-    error: str = None
-
-class Place(BaseModel):
-    place_id: str
-    name: str
-    rating: float = None
-    reviews_count: int = None
-    address: str = None
-    lat: float
-    long: float
-    category: str = None
-    image_url: str = None
-    caption_idn: str = None
-    caption_eng: str = None
-
-class PlaceCoordinates(BaseModel):
-    place_id: str
-    name: str
-    lat: float
-    long: float
 
 # Utility functions
 def fetch_fields(doc):
@@ -82,7 +63,7 @@ def read_root():
     return {"message": "REST API for Journey on Solo"}
 
 # Endpoint Sign-Up
-@app.post("/signup", response_model=AuthResponse)
+@app.post("/signup")
 async def signup(user: User):
     try:
         user_record = auth.create_user(
@@ -91,17 +72,15 @@ async def signup(user: User):
             email_verified=False,
             disabled=False
         )
-        return AuthResponse(message="Signup successful", token=user_record.uid)
-    except auth.EmailAlreadyExistsError:
-        raise HTTPException(status_code=400, detail={"message": "Signup failed", "error": "Email already exists"})
+        return user_record
     except Exception as e:
         raise HTTPException(status_code=400, detail={"message": "Signup failed", "error": str(e)})
 
 # Endpoint Login
-@app.post("/login", response_model=AuthResponse)
+@app.post("/login")
 async def login(user: User):
     try:
-        api_key = os.getenv("FIREBASE_API_KEY", "AIzaSyDxCpXsq-ZSEVHKXqZgO-059JaALp9mXWY")  # Replace with your API Key
+        api_key = "AIzaSyDxCpXsq-ZSEVHKXqZgO-059JaALp9mXWY"  # Replace with your API Key
         url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
         
         async with httpx.AsyncClient() as client:
@@ -117,12 +96,12 @@ async def login(user: User):
 
         id_token = response.json().get("idToken")
 
-        return AuthResponse(message="Login successful", token=id_token)
+        return {"message": "Login successful", "token": id_token}
     except Exception as e:
         raise HTTPException(status_code=400, detail={"message": "Login failed", "error": str(e)})
 
 # Firestore data endpoints
-@app.get("/data", response_model=list[Place])
+@app.get("/data")
 async def get_data():
     try:
         collection_ref = db.collection('location')
@@ -132,18 +111,18 @@ async def get_data():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/data/{place_id}", response_model=Place)
+@app.get("/data/{place_id}")
 async def get_detail_data(place_id: str):
     try:
-        doc_ref = db.collection('location').document(place_id)
-        doc = doc_ref.get()
-        if doc.exists:
+        collection_ref = db.collection('location')
+        query_ref = collection_ref.where('place_id', '==', place_id).limit(1).get()
+        for doc in query_ref:
             return fetch_fields(doc)
         raise HTTPException(status_code=404, detail=f"Document with place_id '{place_id}' not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/coordinates", response_model=list[PlaceCoordinates])
+@app.get("/coordinates")
 async def get_all_coordinates():
     try:
         collection_ref = db.collection('location')
@@ -153,16 +132,52 @@ async def get_all_coordinates():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/coordinates/{place_id}", response_model=PlaceCoordinates)
+@app.get("/coordinates/{place_id}")
 async def get_coordinates(place_id: str):
     try:
-        doc_ref = db.collection('location').document(place_id)
-        doc = doc_ref.get()
-        if doc.exists:
+        collection_ref = db.collection('location')
+        query_ref = collection_ref.where('place_id', '==', place_id).limit(1).get()
+        for doc in query_ref:
             return fetch_lon_lat(doc)
         raise HTTPException(status_code=404, detail=f"Document with place_id '{place_id}' not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict")
+async def predict(request: Request):
+    try:
+        data = await request.json()
+        if 'features' not in data:
+            raise HTTPException(status_code=400, detail={"error": "'features' key not found in the request data"})
+        features = data['features']
+        input_data = np.array([features])
+        predictions = model.predict(input_data)
+        #predicted_class = np.argmax(predictions, axis=1).tolist()
+        #return {"predictions": predicted_class}
+        return predictions
+    except ValueError as ve:
+        logging.error(f"Value error: {str(ve)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(ve)}")
+    except Exception as e:
+        logging.error(f"Prediction error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+
+# # Prediction endpoint
+# @app.post("/predict")
+# async def predict(request: Request):
+#     try:
+#         data = await request.json()
+#         if 'features' not in data:
+#             return JSONResponse(status_code=400, content={"error": "'features' key not found in the request data"})
+#         features = data['features']
+#         input_data = np.array([features])
+#         predictions = model.predict(input_data)
+#         predicted_class = np.argmax(predictions, axis=1).tolist()
+#         return {"predictions": predicted_class}
+#     except Exception as e:
+#         logging.error(f"Prediction error: {str(e)}")
+#         raise HTTPException(status_code=500, detail=str(e))
 
 # Start the server
 if __name__ == "__main__":
